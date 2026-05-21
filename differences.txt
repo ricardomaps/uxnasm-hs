@@ -1,5 +1,0 @@
-This assembler does not stick to behaving 1:1 with c version of the uxntal assembler
-Some of the differences are:
-
-1) comments are ignored just as whitespace so you can use them as separators, also nesting is handled differently
-2) brackets can "touch" other tokens and they have to be closed

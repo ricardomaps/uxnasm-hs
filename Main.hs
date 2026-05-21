@@ -282,7 +282,7 @@ deanon xs = evalState (go xs) 0
     fresh = do
       n <- get
       put (n + 1)
-      return $ T.show n
+      return $ "__anon_" <> (T.show n)
 
 expandMacros :: [Asm] -> [Asm]
 expandMacros xs = evalState (go xs) Map.empty
@@ -313,7 +313,7 @@ resolveAddresses = go Map.empty 0x100
     go labels off [] = Right (labels, [])
 
     go labels off (Label name : xs)
-      -- | T.all isHexDigit name  = Left (NumericLabel name)
+      | T.all isHexDigit name  = Left (NumericLabel name)
       | (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name) = Left (OpcodeLabel name)
       | Map.member name labels = Left (DuplicateLabel name)
       | otherwise              = go (Map.insert name off labels) off xs 
