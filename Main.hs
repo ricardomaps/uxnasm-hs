@@ -71,8 +71,7 @@ data AssembleError
   | ForwardPaddingRef Text
   | RelativeJumpOutOfRange Text
   | DuplicateLabel Text
-  | NumericLabel Text
-  | OpcodeLabel Text
+  | InvalidLabel Text
   | WritingRewind Text
   | ZeroPageWrite Text Word16
   | ParseError Text
@@ -88,8 +87,7 @@ renderError e = case e of
   RelativeJumpOutOfRange t ->
     "relative jump out of range to '" ++ T.unpack t
   DuplicateLabel t          -> "duplicate label: " ++ T.unpack t
-  NumericLabel t            -> "numeric label: " ++ T.unpack t
-  OpcodeLabel t             -> "label shadows opcode: " ++ T.unpack t
+  InvalidLabel t            -> "label " ++ T.unpack t ++ " does not fit the format for a label"
   WritingRewind t           -> "write would rewind past label: " ++ T.unpack t
   ZeroPageWrite t addr      ->
     "" ++ T.unpack t ++ "' at 0x" ++ show addr ++ " cannot be written as zero-page"
@@ -195,129 +193,71 @@ asm :: Assembler [Asm]
 asm = optional ignored *> sepEndBy items ignored
   where
     items = choice
-      [    literal,    jump,    padding,    addressing
-      ,    ascii,   macro,   label,   sublabel,   include,   (try opcode)
-      ,    (RawBinary <$> binary),   routine
+      [ literal, jump, padding, addressing
+      , ascii, macro, label, sublabel, include, (try opcode)
+      , (RawBinary <$> binary), routine
       ]
 
-resolveScope :: [Asm] -> [Asm]
-resolveScope asm = evalState (mapM step asm) ""
+desugar :: [Asm] -> Either AssembleError [Asm]
+desugar = go "" [] [] 0
   where
-    step (Label name) = do
-      let (newScope, _) = T.breakOn "/" name
-      put newScope
-      return (Label name)
+    go _ _ _ _ [] = Right []
 
-    step (SubLabel name) = do
-      currentScope <- get
-      return $ Label (currentScope <> "/" <> name)
+    go scope macros labels lcount (Macro name body : xs)
+      | invalidName name = Left (InvalidLabel name)
+      | isDuplicate name macros labels = Left (DuplicateLabel name)
+      | otherwise = go scope ((name, body) : macros) labels lcount xs
 
-    step (Routine name) = do
-      currentScope <- get
-      return $ Routine (applyScope currentScope name)
+    go scope macros labels lcount (Label name : xs)
+      | invalidName name = Left (InvalidLabel name)
+      | isDuplicate name macros labels = Left (DuplicateLabel name)
+      | otherwise =
+          let (newScope, _) = T.breakOn "/" name
+          in Label name <:> go newScope macros (name : labels) lcount xs
 
-    step (Jump j (Named name)) = do
-      currentScope <- get
-      return $ Jump j (Named (applyScope currentScope name))
+    go scope macros labels lcount (SubLabel name : xs)
+      | invalidName labelName = Left (InvalidLabel name)
+      | isDuplicate labelName macros labels = Left (DuplicateLabel labelName)
+      | otherwise = Label labelName <:> go scope macros (labelName : labels) lcount xs
+        where labelName = scope <> "/" <> name
 
-    step (Jump j (Anon body)) = do
-      body' <- mapM step body
-      return $ Jump j (Anon body')
+    go scope macros labels lcount (Jump j (Anon body) : xs) =
+      let lambdaName = "λ" <> T.show lcount
+      in Jump j (Named lambdaName) <:> go scope macros labels (lcount + 1) (body ++ Label lambdaName : xs)
 
-    step (Addr a m (Named name)) = do
-      currentScope <- get
-      return $ Addr a m (Named (applyScope currentScope name))
+    go scope macros labels lcount (Addr a m (Anon body) : xs) =
+      let lambdaName = "λ" <> T.show lcount
+      in Addr a m (Named lambdaName) <:> go scope macros labels (lcount + 1) (body ++ Label lambdaName : xs)
 
-    step (Addr a m (Anon body)) = do
-      body' <- mapM step body
-      return $ Addr a m (Anon body')
+    go scope macros labels lcount (Jump j (Named name) : xs) =
+      Jump j (Named (addScope scope name)) <:> go scope macros labels lcount xs
 
-    step (Macro name body) = do
-      body' <- mapM step body
-      return (Macro name body')
-      
-    step x = return x
+    go scope macros labels lcount (Addr a m (Named name) : xs) =
+      Addr a m (Named (addScope scope name)) <:> go scope macros labels lcount xs
 
-    applyScope scope name
-      | "/" `T.isPrefixOf` name = scope <> name
-      | "&" `T.isPrefixOf` name = scope <> "/" <> T.drop 1 name
-      | otherwise                 = name
+    go scope macros labels lcount (Routine name : xs) = 
+      case lookup name macros of
+        Just body -> go scope macros labels lcount (body ++ xs)
+        Nothing   -> Jump JSI (Named name) <:> go scope macros labels lcount xs
 
-resolveRoutines :: [Asm] -> [Asm]
-resolveRoutines asm = map step asm
-  where
-    macros = map (\(Macro name _) -> name) $ filter isMacro asm
-    isMacro (Macro _ _) = True
-    isMacro _           = False
+    go scope macros labels lcount (x:xs) = x <:> go scope macros labels lcount xs
 
-    step (Macro name body) = Macro name (map step body) 
-
-    step (Routine t) = if t `elem` macros then MacroCall t else Jump JSI (Named t)
-
-    step (Addr a m (Anon body)) = Addr a m (Anon (map step body))
-      
-    step (Jump j (Anon body)) = Jump j (Anon (map step body))
-
-    step x = x
-
-deanon :: [Asm] -> [Asm]
-deanon xs = evalState (go xs) 0
-  where
-    go [] = return []
-
-    go (Jump j (Anon body) : xs) = do
-      lbl   <- fresh
-      body' <- go body
-      xs'   <- go xs
-      return $ Jump j (Named lbl) : body' ++ [Label lbl] ++ xs'
-
-    go (Addr a m (Anon body) : xs) = do
-      lbl   <- fresh
-      body' <- go body
-      xs'   <- go xs
-      return $ Addr a m (Named lbl) : body' ++ [Label lbl] ++ xs'
-
-    go (x:xs) = (x:) <$> go xs
-
-    fresh = do
-      n <- get
-      put (n + 1)
-      return $ "__anon_" <> (T.show n)
-
-expandMacros :: [Asm] -> [Asm]
-expandMacros xs = evalState (go xs) Map.empty
-  where
-    go [] = return []
-
-    go (Macro name asm : xs) = modify (Map.insert name asm) >> go xs
-
-    go (MacroCall name : xs) = do
-      macros <- get
-      go (fromJust (Map.lookup name macros) ++ xs)
-
-    go (Jump j (Anon body) : xs) = do
-      body' <- go body
-      xs'   <- go xs
-      return (Jump j (Anon body') : xs')
-
-    go (Addr a m (Anon body) : xs) = do
-      body' <- go body
-      xs'   <- go xs
-      return (Addr a m (Anon body') : xs')
-
-    go (x:xs) = (x:) <$> go xs
+    (<:>) x xs = fmap (x :) xs
+    isDuplicate name macros labels = name `member` macros || name `elem` labels  
+    member x xs = maybe False (const True) (lookup x xs)
+    addScope scope name
+      | "/" `T.isPrefixOf` name || "&" `T.isPrefixOf` name = scope <> "/" <> T.tail name
+      | otherwise = name
+    invalidName name = 
+      T.all isHexDigit name || (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name)
+      where opcodes = map T.show ([minBound..maxBound] :: [Opcode]) 
 
 resolveAddresses :: [Asm] -> Either AssembleError (Map Text Word16, [(Asm, Word16)])
 resolveAddresses = go Map.empty 0x100
   where
     go labels off [] = Right (labels, [])
 
-    go labels off (Label name : xs)
-      | T.all isHexDigit name  = Left (NumericLabel name)
-      | (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name) = Left (OpcodeLabel name)
-      | Map.member name labels = Left (DuplicateLabel name)
-      | otherwise              = go (Map.insert name off labels) off xs 
-      where opcodes = map T.show ([minBound..maxBound] :: [Opcode]) 
+    go labels off (Label name : xs) = go (Map.insert name off labels) off xs 
 
     go labels off (x:xs) = do
       off'            <- advance labels off x
@@ -440,10 +380,8 @@ main = do
     [input, output] -> do
       result <- runExceptT $ do
         asm              <- readAsm (T.pack input)
-        (labels, tagged) <- liftEither . resolveAddresses
-                              . deanon . expandMacros
-                              . resolveRoutines . resolveScope
-                              $ asm
+        asm'             <- liftEither $ desugar asm
+        (labels, tagged) <- liftEither $ resolveAddresses asm
         chunks           <- liftEither $ chunkify tagged
         put              <- liftEither $ emit labels chunks
         liftIO $ BS.writeFile output . BS.toStrict . runPut $ put
