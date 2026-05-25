@@ -198,59 +198,88 @@ asm = optional ignored *> sepEndBy items ignored
       , (RawBinary <$> binary), routine
       ]
 
-desugar :: [Asm] -> Either AssembleError [Asm]
-desugar = go "" [] [] 0
+data DesugarState = DesugarState
+  { scope   :: Text
+  , macros  :: [(Text, [Span])]
+  , labels  :: [Text]
+  , lcount  :: Int
+  }
+
+type Desugar a = StateT DesugarState (Either AssembleError) a
+
+initialState :: DesugarState
+initialState = DesugarState { scope = "", macros = [], labels = [], lcount = 0 }
+
+desugar :: [Span] -> Either AssembleError [Span]
+desugar spans = evalStateT (go spans) initialState
   where
-    go _ _ _ _ [] = Right []
+    go [] = return []
+    
+    go ((pos, Macro name body) : xs) = do
+      st <- get
+      when (invalidName name) $ lift (Left (InvalidLabel pos name))
+      when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
+      modify $ \s -> s { macros = (name, body) : macros s }
+      go xs
+      
+    go ((pos, Label name) : xs) = do
+      st <- get
+      when (invalidName name) $ lift (Left (InvalidLabel pos name))
+      when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
+      let (newScope, _) = T.breakOn "/" name
+      modify $ \s -> s { scope = newScope, labels = name : labels s }
+      ((pos, Label name) :) <$> go xs
 
-    go scope macros labels lcount (Macro name body : xs)
-      | invalidName name = Left (InvalidLabel name)
-      | isDuplicate name macros labels = Left (DuplicateLabel name)
-      | otherwise = go scope ((name, body) : macros) labels lcount xs
+    go ((pos, SubLabel name) : xs) = do
+      st <- get
+      let labelName = scope st <> "/" <> name
+      when (invalidName labelName) $ lift (Left (InvalidLabel pos name))
+      when (isDuplicate labelName (macros st) (labels st)) $ lift (Left (DuplicateLabel pos labelName))
+      modify $ \s -> s { labels = labelName : labels s }
+      ((pos, Label labelName) :) <$> go xs
 
-    go scope macros labels lcount (Label name : xs)
-      | invalidName name = Left (InvalidLabel name)
-      | isDuplicate name macros labels = Left (DuplicateLabel name)
-      | otherwise =
-          let (newScope, _) = T.breakOn "/" name
-          in Label name <:> go newScope macros (name : labels) lcount xs
+    go ((pos, Jump j (Anon body)) : xs) = do
+      lambdaName <- freshLambda
+      result <- go body
+      rest   <- go xs
+      return $ (pos, Jump j (Named lambdaName)) : result ++ (pos, Label lambdaName) : rest
 
-    go scope macros labels lcount (SubLabel name : xs)
-      | invalidName labelName = Left (InvalidLabel name)
-      | isDuplicate labelName macros labels = Left (DuplicateLabel labelName)
-      | otherwise = Label labelName <:> go scope macros (labelName : labels) lcount xs
-        where labelName = scope <> "/" <> name
+    go ((pos, Addr a m (Anon body)) : xs) = do
+      lambdaName <- freshLambda
+      result <- go body
+      rest   <- go xs
+      return $ (pos, Addr a m (Named lambdaName)) : result ++ (pos, Label lambdaName) : rest
 
-    go scope macros labels lcount (Jump j (Anon body) : xs) =
-      let lambdaName = "λ" <> T.show lcount
-      in Jump j (Named lambdaName) <:> go scope macros labels (lcount + 1) (body ++ Label lambdaName : xs)
+    go ((pos, Jump j (Named name)) : xs) = do
+      sc <- gets scope
+      ((pos, Jump j (Named (addScope sc name))) :) <$> go xs
 
-    go scope macros labels lcount (Addr a m (Anon body) : xs) =
-      let lambdaName = "λ" <> T.show lcount
-      in Addr a m (Named lambdaName) <:> go scope macros labels (lcount + 1) (body ++ Label lambdaName : xs)
+    go ((pos, Addr a m (Named name)) : xs) = do
+      sc <- gets scope
+      ((pos, Addr a m (Named (addScope sc name))) :) <$> go xs
 
-    go scope macros labels lcount (Jump j (Named name) : xs) =
-      Jump j (Named (addScope scope name)) <:> go scope macros labels lcount xs
+    go ((pos, Routine name) : xs) = do
+      st <- get
+      let nameScoped = addScope (scope st) name
+      case lookup nameScoped (macros st) of
+        Just body -> go (body ++ xs)
+        Nothing   -> ((pos, Jump JSI (Named nameScoped)) :) <$> go xs
 
-    go scope macros labels lcount (Addr a m (Named name) : xs) =
-      Addr a m (Named (addScope scope name)) <:> go scope macros labels lcount xs
+    go (x:xs) = (x :) <$> go xs
 
-    go scope macros labels lcount (Routine name : xs) = 
-      case lookup name macros of
-        Just body -> go scope macros labels lcount (body ++ xs)
-        Nothing   -> Jump JSI (Named name) <:> go scope macros labels lcount xs
+    freshLambda = do
+      n <- gets lcount
+      modify $ \s -> s { lcount = n + 1 }
+      return $ "λ" <> T.show n
 
-    go scope macros labels lcount (x:xs) = x <:> go scope macros labels lcount xs
-
-    (<:>) x xs = fmap (x :) xs
-    isDuplicate name macros labels = name `member` macros || name `elem` labels  
+    isDuplicate name macros labels = name `member` macros || name `elem` labels
     member x xs = maybe False (const True) (lookup x xs)
     addScope scope name
       | "/" `T.isPrefixOf` name || "&" `T.isPrefixOf` name = scope <> "/" <> T.tail name
       | otherwise = name
-    invalidName name = 
+    invalidName name =
       T.all isHexDigit name || (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name)
-      where opcodes = map T.show ([minBound..maxBound] :: [Opcode]) 
+      where opcodes = map T.show ([minBound..maxBound] :: [Opcode])
 
 resolveAddresses :: [Asm] -> Either AssembleError (Map Text Word16, [(Asm, Word16)])
 resolveAddresses = go Map.empty 0x100
