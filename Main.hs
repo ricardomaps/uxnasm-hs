@@ -6,7 +6,7 @@ import Data.Text (Text)
 import Data.Text.IO (readFile)
 import Data.Text.Encoding
 import qualified Data.Text as T
-import Text.Parsec hiding (label, labels, State)
+import Text.Parsec hiding (label, labels, State, token)
 import Text.Parsec.Text (Parser)
 import Text.Parsec.Error
 import Data.Binary hiding (Binary, get, put)
@@ -48,7 +48,7 @@ data Addressing = RelativeAddr | ZeroPageAddr | AbsoluteAddr deriving (Show, Eq)
 
 data AddressingMode = RawAddressing | LiteralAddressing deriving (Show, Eq)
 
-data Ref = Named Text | Anon [Asm] deriving Show
+data Ref = Named Text | Anon [Span] deriving Show
 
 data Asm
   = Instr Opcode OpcodeMode
@@ -61,37 +61,37 @@ data Asm
   | Label Text
   | SubLabel Text
   | Routine Text
-  | Macro Text [Asm]
+  | Macro Text [Span]
   | Addr Addressing AddressingMode Ref
   | Include Text
   deriving Show
 
+type Span = (SourcePos, Asm)
+
 data AssembleError
-  = UndefinedLabel Text
-  | ForwardPaddingRef Text
-  | RelativeJumpOutOfRange Text
-  | DuplicateLabel Text
-  | InvalidLabel Text
-  | WritingRewind Text
-  | ZeroPageWrite Text Word16
-  | ParseError Text
+  = UndefinedLabel SourcePos Text
+  | ForwardPaddingRef SourcePos Text
+  | RelativeJumpOutOfRange SourcePos Text
+  | DuplicateLabel SourcePos Text
+  | InvalidLabel SourcePos Text
+  | WritingRewind SourcePos Word16
+  | ZeroPageWrite SourcePos Word16
+  | ParserError ParseError
   | FileError Text
   deriving Show
 
-data Chunk = Chunk Word16 [(Asm, Word16)]
+data Chunk = Chunk Word16 [(Span, Word16)]
 
 renderError :: AssembleError -> String
 renderError e = case e of
-  UndefinedLabel t          -> "undefined label: " ++ T.unpack t
-  ForwardPaddingRef t       -> "forward reference in padding: " ++ T.unpack t
-  RelativeJumpOutOfRange t ->
-    "relative jump out of range to '" ++ T.unpack t
-  DuplicateLabel t          -> "duplicate label: " ++ T.unpack t
-  InvalidLabel t            -> "label " ++ T.unpack t ++ " does not fit the format for a label"
-  WritingRewind t           -> "write would rewind past label: " ++ T.unpack t
-  ZeroPageWrite t addr      ->
-    "" ++ T.unpack t ++ "' at 0x" ++ show addr ++ " cannot be written as zero-page"
-  ParseError t              -> "parse error: " ++ T.unpack t
+  UndefinedLabel p t         -> "undefined label: " ++ T.unpack t ++ " at " ++ show p
+  ForwardPaddingRef p t      -> "forward reference in padding: " ++ T.unpack t ++ " at " ++ show p
+  RelativeJumpOutOfRange p t -> "relative jump out of range to '" ++ T.unpack t ++ " at " ++ show p
+  DuplicateLabel p t         -> "duplicate label: " ++ T.unpack t ++ " at " ++ show p
+  InvalidLabel p t           -> "label " ++ T.unpack t ++ " at " ++ show p ++ " does not fit the format for a label"
+  WritingRewind p o          -> "write rewind to previously written offset " ++ show o ++ " at " ++ show p 
+  ZeroPageWrite p o          -> "write to zero-page at " ++ show p ++ " at offset " ++ show o
+  ParserError e              -> show e
 
 readHex :: (Read a) => String -> a
 readHex = read . ("0x" ++)
@@ -189,10 +189,16 @@ ignored = skipMany (void (oneOf " \n\t\r\v[]") <|> comment)
 include :: Assembler Asm
 include = char '~' *> (Include <$> name)
 
-asm :: Assembler [Asm]
+token :: Assembler Asm -> Assembler Span
+token p = do
+  pos <- getPosition
+  asm <- p
+  return (pos, asm)
+
+asm :: Assembler [Span]
 asm = optional ignored *> sepEndBy items ignored
   where
-    items = choice
+    items = choice $ token <$>
       [ literal, jump, padding, addressing
       , ascii, macro, label, sublabel, include, (try opcode)
       , (RawBinary <$> binary), routine
@@ -281,40 +287,38 @@ desugar spans = evalStateT (go spans) initialState
       T.all isHexDigit name || (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name)
       where opcodes = map T.show ([minBound..maxBound] :: [Opcode])
 
-resolveAddresses :: [Asm] -> Either AssembleError (Map Text Word16, [(Asm, Word16)])
-resolveAddresses = go Map.empty 0x100
+resolveAddresses :: [Span] -> Either AssembleError ([(Text, Word16)], [(Span, Word16)])
+resolveAddresses = go [] 0x100
   where
     go labels off [] = Right (labels, [])
-
-    go labels off (Label name : xs) = go (Map.insert name off labels) off xs 
-
+    go labels off ((pos, Label name) : xs) = go ((name, off) : labels) off xs 
     go labels off (x:xs) = do
       off'            <- advance labels off x
       (labels', rest) <- go labels off' xs
       return (labels', (x, off) : rest)
 
-    advance _ off (RawBinary (Byte _))           = Right $ off + 1
-    advance _ off (RawBinary (Short _))          = Right $ off + 2
-    advance _ off (Literal (Byte _))             = Right $ off + 2
-    advance _ off (Literal (Short _))            = Right $ off + 3
-    advance _ off (Ascii text)                   = Right $ off + fromIntegral (T.length text)
-    advance _ off (Instr _ _ )                   = Right $ off + 1
-    advance _ off (Jump _ _)                     = Right $ off + 3
-    advance l off (Addr d LiteralAddressing ref) = (1 +) <$> advance l off (Addr d RawAddressing ref)
-    advance _ off (Addr d RawAddressing _)       = Right $ off + if d == AbsoluteAddr then 2 else 1
-    advance _ off (Padding t (Hex x))            = Right $
+    advance _ off ((_, RawBinary (Byte _)))             = Right $ off + 1
+    advance _ off ((_, RawBinary (Short _)))            = Right $ off + 2
+    advance _ off ((_, Literal (Byte _)))               = Right $ off + 2
+    advance _ off ((_, Literal (Short _)))              = Right $ off + 3
+    advance _ off ((_, Ascii text))                     = Right $ off + fromIntegral (T.length text)
+    advance _ off ((_, Instr _ _ ))                     = Right $ off + 1
+    advance _ off ((_, Jump _ _))                       = Right $ off + 3
+    advance l off ((pos, Addr d LiteralAddressing ref)) = (1 +) <$> advance l off (pos, Addr d RawAddressing ref)
+    advance _ off ((pos, Addr d RawAddressing _))       = Right $ off + if d == AbsoluteAddr then 2 else 1
+    advance _ off ((_, Padding t (Hex x)))              = Right $
       case t of
         RelativePadding -> off + x
         AbsolutePadding -> x
-    advance l off (Padding t (Ident i)) =
-      case Map.lookup i l of
-        Nothing -> Left (ForwardPaddingRef i)
+    advance l off ((pos, Padding t (Ident i))) =
+      case lookup i l of
+        Nothing -> Left (ForwardPaddingRef pos i)
         Just x  -> Right $ case t of
           RelativePadding -> off + x
           AbsolutePadding -> x
     advance _ off _ = Right off
 
-chunkify :: [(Asm, Word16)] -> Either AssembleError [Chunk]
+chunkify :: [(Span, Word16)] -> Either AssembleError [Chunk]
 chunkify [] = Right []
 chunkify xs =
   let (pads, rest)    = span (isPadding . fst) xs
@@ -324,17 +328,19 @@ chunkify xs =
          chunks <- chunkify rest'
          return $ Chunk 0 instrs : chunks
        (_, []) -> Right []
-       ((_, start):_, (_, end):_) ->
+       ((_, start):_, ((pos, _), end):_) ->
          if end < start
-           then Left (WritingRewind (T.pack $ "0x" ++ show start ++ " -> 0x" ++ show end))
-           else do
-             chunks <- chunkify rest'
-             return $ Chunk (end - start) instrs : chunks
+           then Left (WritingRewind pos end)
+        else if end < 0x100
+          then Left (ZeroPageWrite undefined end)
+        else do
+          chunks <- chunkify rest'
+          return $ Chunk (end - start) instrs : chunks
   where
-    isPadding (Padding _ _) = True
+    isPadding ((_, Padding _ _)) = True
     isPadding _             = False
 
-emit :: Map Text Word16 -> [Chunk] -> Either AssembleError Put
+emit :: [(Text, Word16)] -> [Chunk] -> Either AssembleError Put
 emit labels chunks = do
   puts <- mapM emitChunk chunks
   return $ sequence_ puts
@@ -343,17 +349,17 @@ emit labels chunks = do
           steps <- mapM step asm
           return $ putByteString (BS.replicate (fromIntegral n) 0x00) >> sequence_ steps
 
-    step (RawBinary (Byte b),  _) = return $ putWord8 b
+    step ((_, RawBinary (Byte b)),  _) = return $ putWord8 b
 
-    step (RawBinary (Short s), _) = return $ putWord16be s
+    step ((_, RawBinary (Short s)), _) = return $ putWord16be s
 
-    step (Literal (Byte b),    _) = return $ putWord8 0x80 >> putWord8 b
+    step ((_, Literal (Byte b)),    _) = return $ putWord8 0x80 >> putWord8 b
 
-    step (Literal (Short s),   _) = return $ putWord8 0xa0 >> putWord16be s
+    step ((_, Literal (Short s)),   _) = return $ putWord8 0xa0 >> putWord16be s
 
-    step (Ascii text,          _) = return $ putByteString (encodeUtf8 text)
+    step ((_, Ascii text),          _) = return $ putByteString (encodeUtf8 text)
 
-    step (Instr opcode mode,   _) = return $ putWord8 (byte .|. flags)
+    step ((_, Instr opcode mode),   _) = return $ putWord8 (byte .|. flags)
       where
         byte  = if opcode == LIT then 0x80 else fromIntegral (fromEnum opcode)
         flags = foldr (.|.) 0x00
@@ -362,13 +368,13 @@ emit labels chunks = do
           , if keepMode   mode then 0x80 else 0x00
           ]
 
-    step (Jump j (Named n), off) = do
-      target <- lookupLabel n
+    step ((pos, Jump j (Named n)), off) = do
+      target <- lookupLabel pos n
       let op  = case j of JSI -> 0x60; JMI -> 0x40; JCI -> 0x20
       return $ putWord8 op >> putWord16be (target - (off + 1) - 2)
 
-    step (Addr a m (Named n), off) = do
-      target <- lookupLabel n
+    step ((pos, Addr a m (Named n)), off) = do
+      target <- lookupLabel pos n
       let
         litSize = if m == LiteralAddressing then 1 else 0
         lit =
@@ -383,23 +389,23 @@ emit labels chunks = do
           RelativeAddr ->
             let delta = fromIntegral (target - (off + litSize) - 2) :: Int16
             in if delta < -128 || delta > 127
-                 then Left (RelativeJumpOutOfRange n)
+                 then Left (RelativeJumpOutOfRange pos n)
                  else return $ putWord8 (fromIntegral delta)
       return $ lit >> ref
 
     step x = error $ "found " ++ show x ++ " on emit phase"
 
-    lookupLabel n = case Map.lookup n labels of
-      Nothing     -> Left (UndefinedLabel n)
+    lookupLabel pos n = case lookup n labels of
+      Nothing     -> Left (UndefinedLabel pos n)
       Just target -> Right target
 
-readAsm :: Text -> ExceptT AssembleError IO [Asm]
+readAsm :: Text -> ExceptT AssembleError IO [Span]
 readAsm file = do
   contents <- ExceptT $ first (FileError . T.pack . show) <$> (E.try $ readFile (T.unpack file) :: IO (Either IOException Text))
-  ast      <- liftEither . first (ParseError . T.pack . show) $ parse (asm <* eof) (T.unpack file) contents
+  ast      <- liftEither . first ParserError $ parse (asm <* eof) (T.unpack file) contents
   concat <$> mapM include ast
   where
-    include (Include f) = readAsm f
+    include ((_, Include f)) = readAsm f
     include x           = return [x]
 
 main :: IO ()
@@ -410,7 +416,8 @@ main = do
       result <- runExceptT $ do
         asm              <- readAsm (T.pack input)
         asm'             <- liftEither $ desugar asm
-        (labels, tagged) <- liftEither $ resolveAddresses asm
+        (labels, tagged) <- liftEither $ resolveAddresses asm'
+        liftIO $ print labels
         chunks           <- liftEither $ chunkify tagged
         put              <- liftEither $ emit labels chunks
         liftIO $ BS.writeFile output . BS.toStrict . runPut $ put
