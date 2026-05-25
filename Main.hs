@@ -19,6 +19,7 @@ import Control.Monad
 import Control.Monad.State
 import Data.Bits
 import System.Environment
+import System.IO hiding (readFile)
 import Data.Bifunctor (first, second)
 import qualified Data.ByteString as BS
 import Control.Exception (IOException)
@@ -92,6 +93,7 @@ renderError e = case e of
   WritingRewind p o          -> "write rewind to previously written offset " ++ show o ++ " at " ++ show p 
   ZeroPageWrite p o          -> "write to zero-page at " ++ show p ++ " at offset " ++ show o
   ParserError e              -> show e
+  FileError e                -> "could not read file: " ++ show e
 
 readHex :: (Read a) => String -> a
 readHex = read . ("0x" ++)
@@ -234,7 +236,7 @@ desugar spans = evalStateT (go spans) initialState
       when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
       let (newScope, _) = T.breakOn "/" name
       modify $ \s -> s { scope = newScope, labels = name : labels s }
-      ((pos, Label name) :) <$> go xs
+      (pos, Label name) <:> go xs
 
     go ((pos, SubLabel name) : xs) = do
       st <- get
@@ -242,7 +244,7 @@ desugar spans = evalStateT (go spans) initialState
       when (invalidName labelName) $ lift (Left (InvalidLabel pos name))
       when (isDuplicate labelName (macros st) (labels st)) $ lift (Left (DuplicateLabel pos labelName))
       modify $ \s -> s { labels = labelName : labels s }
-      ((pos, Label labelName) :) <$> go xs
+      (pos, Label labelName) <:> go xs
 
     go ((pos, Jump j (Anon body)) : xs) = do
       lambdaName <- freshLambda
@@ -258,18 +260,18 @@ desugar spans = evalStateT (go spans) initialState
 
     go ((pos, Jump j (Named name)) : xs) = do
       sc <- gets scope
-      ((pos, Jump j (Named (addScope sc name))) :) <$> go xs
+      (pos, Jump j (Named (addScope sc name))) <:> go xs
 
     go ((pos, Addr a m (Named name)) : xs) = do
       sc <- gets scope
-      ((pos, Addr a m (Named (addScope sc name))) :) <$> go xs
+      (pos, Addr a m (Named (addScope sc name))) <:> go xs
 
     go ((pos, Routine name) : xs) = do
       st <- get
       let nameScoped = addScope (scope st) name
       case lookup nameScoped (macros st) of
         Just body -> go (body ++ xs)
-        Nothing   -> ((pos, Jump JSI (Named nameScoped)) :) <$> go xs
+        Nothing   -> (pos, Jump JSI (Named nameScoped)) <:> go xs
 
     go (x:xs) = (x :) <$> go xs
 
@@ -278,6 +280,7 @@ desugar spans = evalStateT (go spans) initialState
       modify $ \s -> s { lcount = n + 1 }
       return $ "λ" <> T.show n
 
+    (<:>) x xs = fmap (x :) xs
     isDuplicate name macros labels = name `member` macros || name `elem` labels
     member x xs = maybe False (const True) (lookup x xs)
     addScope scope name
@@ -406,7 +409,19 @@ readAsm file = do
   concat <$> mapM include ast
   where
     include ((_, Include f)) = readAsm f
-    include x           = return [x]
+    include x                = return [x]
+
+writeSymbols :: FilePath -> [(Text, Word16)] -> ExceptT AssembleError IO ()
+writeSymbols path labels = do
+  h <- liftIO (openBinaryFile path WriteMode) `catchError` \_ -> throwError (FileError (T.pack path))
+  liftIO $ forM_ labels $ \(name, addr) -> do
+    BS.hPut h $ BS.pack [hi addr, lo addr]
+    BS.hPut h $ encodeUtf8 name
+    BS.hPut h $ BS.singleton 0
+  liftIO $ hClose h
+  where
+    hi w = fromIntegral (w `shiftR` 8)
+    lo w = fromIntegral (w .&. 0xFF)
 
 main :: IO ()
 main = do
@@ -415,12 +430,12 @@ main = do
     [input, output] -> do
       result <- runExceptT $ do
         asm              <- readAsm (T.pack input)
-        asm'             <- liftEither $ desugar asm
-        (labels, tagged) <- liftEither $ resolveAddresses asm'
-        liftIO $ print labels
+        desugared        <- liftEither $ desugar asm
+        (labels, tagged) <- liftEither $ resolveAddresses desugared
         chunks           <- liftEither $ chunkify tagged
         put              <- liftEither $ emit labels chunks
         liftIO $ BS.writeFile output . BS.toStrict . runPut $ put
+        writeSymbols (output ++ ".sym") labels
       case result of
         Left  err -> putStrLn $ "error: " ++ renderError err
         Right ()  -> return ()
