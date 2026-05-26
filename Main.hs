@@ -467,5 +467,5 @@ main = do
       case result of
         Left  err -> putStrLn $ "error: " ++ renderError err
         Right ()  -> return ()
-    ["-v"] -> putStrLn "uxnasm - Uxntal Assembler, 04 May 2026."
-    _      -> putStrLn "Usage: uxnasm [-v] input.tal output.rom"
+    ["-v"] -> putStrLn "uxnasm-hs - Uxntal Assembler, 26 May 2026."
+    _      -> putStrLn "Usage: uxnasm-hs [-v] input.tal output.rom"
