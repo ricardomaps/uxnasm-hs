@@ -86,6 +86,18 @@ data AssembleError
 
 data Chunk = Chunk Int [(Span, Int)]
 
+initialOffset :: Int
+initialOffset = 0x100
+
+maxOffset :: Int
+maxOffset = 0x9999
+
+maxLabels :: Int
+maxLabels = 0x400
+
+maxMacros :: Int
+maxMacros = 0x100
+
 renderError :: AssembleError -> String
 renderError e = case e of
   UndefinedLabel p t         -> "undefined label: " ++ T.unpack t ++ " at " ++ show p
@@ -97,6 +109,9 @@ renderError e = case e of
   ZeroPageWrite p o          -> "write to zero-page at " ++ show p ++ " at offset " ++ show o
   ParserError e              -> show e
   FileError e                -> "could not read file: " ++ show e
+  WritingOOM p               -> "writing out of memory limits at: " ++ show p
+  MacrosExceeded p t         -> "macro limit(0x100) exceeded at: " ++ T.unpack t ++ " " ++ show p
+  LabelsExceeded p t         -> "label limit(0x400) exceeded at: " ++ T.unpack t ++ " " ++ show p
 
 readHex :: (Read a) => String -> a
 readHex = read . ("0x" ++)
@@ -232,7 +247,7 @@ desugar spans = evalStateT (go spans) initialState
       st <- get
       when (invalidName name) $ lift (Left (InvalidLabel pos name))
       when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
-      when (macroCount st >= 100) $ lift (Left (MacrosExceeded pos name ))
+      when (macroCount st >= maxMacros) $ lift (Left (MacrosExceeded pos name ))
       modify $ \s -> s { macros = Map.insert name body (macros s), macroCount = macroCount s + 1 }
       go xs
       
@@ -240,7 +255,7 @@ desugar spans = evalStateT (go spans) initialState
       st <- get
       when (invalidName name) $ lift (Left (InvalidLabel pos name))
       when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
-      when (labelCount st >= 400) $ lift (Left (LabelsExceeded pos name ))
+      when (labelCount st >= maxLabels) $ lift (Left (LabelsExceeded pos name ))
       let (newScope, _) = T.breakOn "/" name
       modify $ \s -> s { scope = newScope, labels = Set.insert name (labels s), labelCount = labelCount s + 1 }
       (pos, Label name) <:> go xs
@@ -250,7 +265,7 @@ desugar spans = evalStateT (go spans) initialState
       let labelName = scope st <> "/" <> name
       when (invalidName labelName) $ lift (Left (InvalidLabel pos name))
       when (isDuplicate labelName (macros st) (labels st)) $ lift (Left (DuplicateLabel pos labelName))
-      when (labelCount st >= 400) $ lift (Left (LabelsExceeded pos name ))
+      when (labelCount st >= maxLabels) $ lift (Left (LabelsExceeded pos name ))
       modify $ \s -> s { labels = Set.insert labelName (labels s), labelCount = labelCount s + 1 }
       (pos, Label labelName) <:> go xs
 
@@ -298,7 +313,7 @@ desugar spans = evalStateT (go spans) initialState
       where opcodes = map T.show ([minBound..maxBound] :: [Opcode])
 
 resolveAddresses :: [Span] -> Either AssembleError (Map Text Int, [(Span, Int)])
-resolveAddresses = go Map.empty 0x100
+resolveAddresses = go Map.empty initialOffset
   where
     go labels off [] = Right (labels, [])
     go labels off ((pos, Label name) : xs) = go (Map.insert name off labels) off xs 
@@ -343,7 +358,7 @@ chunkify xs =
        ((_, start):_, ((pos, _), end):_) ->
          if end < start
            then Left (WritingRewind pos end)
-        else if end < 0x100
+        else if end < initialOffset
           then Left (ZeroPageWrite pos end)
         else do
           chunks <- chunkify rest'
@@ -362,8 +377,8 @@ emit labels chunks = do
           return $ putByteString (BS.replicate (fromIntegral n) 0x00) >> sequence_ steps
 
     step :: (Span, Int) -> Either AssembleError Put
-    step ((pos, _), off) | off < 0x100    = Left (ZeroPageWrite pos off)
-    step ((pos, _), off) | off >= 0x10000 = Left (WritingOOM pos)
+    step ((pos, _), off) | off < initialOffset    = Left (ZeroPageWrite pos off)
+    step ((pos, _), off) | off > maxOffset = Left (WritingOOM pos)
 
     step ((_, RawBinary (Byte b)),  _) = return $ putWord8 b
 
@@ -409,7 +424,7 @@ emit labels chunks = do
                  else return $ putWord8 (fromIntegral delta)
       return $ lit >> ref
 
-    step x = error $ "found " ++ show x ++ " on emit phase"
+    step x = return (pure ())
 
     lookupLabel pos n = case Map.lookup n labels of
       Nothing     -> Left (UndefinedLabel pos n)
