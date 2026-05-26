@@ -27,6 +27,7 @@ import Control.Exception (IOException)
 import qualified Control.Exception as E
 import Control.Monad.Except
 import Prelude hiding (readFile)
+import Debug.Trace
 
 type Assembler a = Parsec Text () a
 
@@ -134,7 +135,7 @@ ascii = char '"' >> do
   return (Ascii str)
 
 opcode :: Assembler Asm
-opcode = do
+opcode = try $ do
   opc <- op
   md  <- mode
   lookAhead delim
@@ -181,7 +182,8 @@ label :: Assembler Asm
 label = char '@' *> (Label <$> name)
 
 sublabel :: Assembler Asm
-sublabel = char '&' *> (SubLabel <$> name)
+sublabel = char '&' *> (SubLabel <$> sublabelName)
+  where sublabelName = T.pack <$> many (satisfy (not . isSpace))
 
 addressing :: Assembler Asm
 addressing = do
@@ -220,7 +222,7 @@ asm = optional ignored *> sepEndBy items ignored
   where
     items = choice $ token <$>
       [ literal, jump, padding, addressing
-      , ascii, macro, label, sublabel, include, (try opcode)
+      , ascii, macro, label, sublabel, include, opcode
       , (RawBinary <$> binary), routine
       ]
 
@@ -309,7 +311,10 @@ desugar spans = evalStateT (go spans) initialState
       | "/" `T.isPrefixOf` name || "&" `T.isPrefixOf` name = scope <> "/" <> T.tail name
       | otherwise = name
     invalidName name =
-      T.all isHexDigit name || (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name)
+      T.null name
+      || T.all isHexDigit name
+      || (T.take 3 name) `elem` opcodes
+      && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name)
       where opcodes = map T.show ([minBound..maxBound] :: [Opcode])
 
 resolveAddresses :: [Span] -> Either AssembleError (Map Text Int, [(Span, Int)])
