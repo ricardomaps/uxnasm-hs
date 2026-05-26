@@ -14,6 +14,8 @@ import Data.Binary.Put
 import Data.Char (isSpace, isHexDigit)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Control.Monad
 import Control.Monad.State
 import Data.Bits
@@ -209,8 +211,8 @@ asm = optional ignored *> sepEndBy items ignored
 
 data DesugarState = DesugarState
   { scope       :: Text
-  , macros      :: [(Text, [Span])]
-  , labels      :: [Text]
+  , macros      :: Map Text [Span]
+  , labels      :: Set Text
   , lambdaCount :: Int
   , macroCount  :: Int
   , labelCount  :: Int
@@ -219,7 +221,7 @@ data DesugarState = DesugarState
 type Desugar a = StateT DesugarState (Either AssembleError) a
 
 initialState :: DesugarState
-initialState = DesugarState { scope = "Top", macros = [], labels = [], lambdaCount = 0, macroCount = 0, labelCount = 0 }
+initialState = DesugarState { scope = "Top", macros = Map.empty, labels = Set.empty, lambdaCount = 0, macroCount = 0, labelCount = 0 }
 
 desugar :: [Span] -> Either AssembleError [Span]
 desugar spans = evalStateT (go spans) initialState
@@ -231,7 +233,7 @@ desugar spans = evalStateT (go spans) initialState
       when (invalidName name) $ lift (Left (InvalidLabel pos name))
       when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
       when (macroCount st >= 100) $ lift (Left (MacrosExceeded pos name ))
-      modify $ \s -> s { macros = (name, body) : macros s, macroCount = macroCount s + 1 }
+      modify $ \s -> s { macros = Map.insert name body (macros s), macroCount = macroCount s + 1 }
       go xs
       
     go ((pos, Label name) : xs) = do
@@ -240,7 +242,7 @@ desugar spans = evalStateT (go spans) initialState
       when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
       when (labelCount st >= 400) $ lift (Left (LabelsExceeded pos name ))
       let (newScope, _) = T.breakOn "/" name
-      modify $ \s -> s { scope = newScope, labels = name : labels s, labelCount = labelCount s + 1 }
+      modify $ \s -> s { scope = newScope, labels = Set.insert name (labels s), labelCount = labelCount s + 1 }
       (pos, Label name) <:> go xs
 
     go ((pos, SubLabel name) : xs) = do
@@ -249,7 +251,7 @@ desugar spans = evalStateT (go spans) initialState
       when (invalidName labelName) $ lift (Left (InvalidLabel pos name))
       when (isDuplicate labelName (macros st) (labels st)) $ lift (Left (DuplicateLabel pos labelName))
       when (labelCount st >= 400) $ lift (Left (LabelsExceeded pos name ))
-      modify $ \s -> s { labels = labelName : labels s, labelCount = labelCount s + 1 }
+      modify $ \s -> s { labels = Set.insert labelName (labels s), labelCount = labelCount s + 1 }
       (pos, Label labelName) <:> go xs
 
     go ((pos, Jump j (Anon body)) : xs) = do
@@ -275,7 +277,7 @@ desugar spans = evalStateT (go spans) initialState
     go ((pos, Routine name) : xs) = do
       st <- get
       let nameScoped = addScope (scope st) name
-      case lookup nameScoped (macros st) of
+      case Map.lookup nameScoped (macros st) of
         Just body -> go (body ++ xs)
         Nothing   -> (pos, Jump JSI (Named nameScoped)) <:> go xs
 
@@ -287,8 +289,7 @@ desugar spans = evalStateT (go spans) initialState
       return $ "λ" <> T.show n
 
     (<:>) x xs = fmap (x :) xs
-    isDuplicate name macros labels = name `member` macros || name `elem` labels
-    member x xs = maybe False (const True) (lookup x xs)
+    isDuplicate name macros labels = name `Map.member` macros || name `Set.member` labels
     addScope scope name
       | "/" `T.isPrefixOf` name || "&" `T.isPrefixOf` name = scope <> "/" <> T.tail name
       | otherwise = name
@@ -296,17 +297,17 @@ desugar spans = evalStateT (go spans) initialState
       T.all isHexDigit name || (T.take 3 name) `elem` opcodes && T.all (\c -> c == '2' || c == 'k' || c == 'r') (T.drop 3 name)
       where opcodes = map T.show ([minBound..maxBound] :: [Opcode])
 
-resolveAddresses :: [Span] -> Either AssembleError ([(Text, Int)], [(Span, Int)])
-resolveAddresses = go [] 0x100
+resolveAddresses :: [Span] -> Either AssembleError (Map Text Int, [(Span, Int)])
+resolveAddresses = go Map.empty 0x100
   where
-    go labels off [] = Right (reverse labels, [])
-    go labels off ((pos, Label name) : xs) = go ((name, off) : labels) off xs 
+    go labels off [] = Right (labels, [])
+    go labels off ((pos, Label name) : xs) = go (Map.insert name off labels) off xs 
     go labels off (x:xs) = do
       off'            <- advance labels off x
       (labels', rest) <- go labels off' xs
       return (labels', (x, off) : rest)
 
-    advance :: [(Text, Int)] -> Int -> Span -> Either AssembleError Int
+    advance :: Map Text Int -> Int -> Span -> Either AssembleError Int
     advance _ off (pos, _) | off > 0x9999 = Left (WritingOOM pos)
     advance _ off (_, RawBinary (Byte _))             = Right $ off + 1
     advance _ off (_, RawBinary (Short _))            = Right $ off + 2
@@ -321,8 +322,8 @@ resolveAddresses = go [] 0x100
       case t of
         RelativePadding -> off + fromIntegral x
         AbsolutePadding -> fromIntegral x
-    advance l off ((pos, Padding t (Ident i))) =
-      case lookup i l of
+    advance l off (pos, Padding t (Ident i)) =
+      case Map.lookup i l of
         Nothing -> Left (ForwardPaddingRef pos i)
         Just x  -> Right $ case t of
           RelativePadding -> off + fromIntegral x
@@ -351,7 +352,7 @@ chunkify xs =
     isPadding ((_, Padding _ _)) = True
     isPadding _             = False
 
-emit :: [(Text, Int)] -> [Chunk] -> Either AssembleError Put
+emit :: Map Text Int -> [Chunk] -> Either AssembleError Put
 emit labels chunks = do
   puts <- mapM emitChunk chunks
   return $ sequence_ puts
@@ -410,7 +411,7 @@ emit labels chunks = do
 
     step x = error $ "found " ++ show x ++ " on emit phase"
 
-    lookupLabel pos n = case lookup n labels of
+    lookupLabel pos n = case Map.lookup n labels of
       Nothing     -> Left (UndefinedLabel pos n)
       Just target -> Right target
 
@@ -423,10 +424,10 @@ readAsm file = do
     include ((_, Include f)) = readAsm f
     include x                = return [x]
 
-writeSymbols :: FilePath -> [(Text, Int)] -> ExceptT AssembleError IO ()
+writeSymbols :: FilePath -> Map Text Int -> ExceptT AssembleError IO ()
 writeSymbols path labels = do
   h <- liftIO (openBinaryFile path WriteMode) `catchError` \_ -> throwError (FileError (T.pack path))
-  liftIO $ forM_ labels $ \(name, addr) -> do
+  liftIO $ forM_ (Map.assocs labels) $ \(name, addr) -> do
     BS.hPut h $ BS.pack [hi addr, lo addr]
     BS.hPut h $ encodeUtf8 name
     BS.hPut h $ BS.singleton 0
