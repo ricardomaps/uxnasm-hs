@@ -9,6 +9,7 @@ import qualified Data.Text as T
 import Text.Parsec hiding (label, labels, State, token)
 import Text.Parsec.Text (Parser)
 import Text.Parsec.Error
+import Text.Printf
 import Data.Binary hiding (Binary, get, put)
 import Data.Binary.Put
 import Data.Char (isSpace, isHexDigit)
@@ -435,13 +436,13 @@ emit labels chunks = do
       Nothing     -> Left (UndefinedLabel pos n)
       Just target -> Right target
 
-readAsm :: Text -> ExceptT AssembleError IO [Span]
+readAsm :: FilePath -> ExceptT AssembleError IO [Span]
 readAsm file = do
-  contents <- ExceptT $ first (FileError . T.pack . show) <$> (E.try $ readFile (T.unpack file) :: IO (Either IOException Text))
-  ast      <- liftEither . first ParserError $ parse (asm <* eof) (T.unpack file) contents
+  contents <- readInput file
+  ast      <- liftEither . first ParserError $ parse (asm <* eof) file contents
   concat <$> mapM include ast
   where
-    include ((_, Include f)) = readAsm f
+    include ((_, Include f)) = readAsm (T.unpack f)
     include x                = return [x]
 
 writeSymbols :: FilePath -> Map Text Int -> ExceptT AssembleError IO ()
@@ -456,19 +457,30 @@ writeSymbols path labels = do
     hi w = fromIntegral (w `shiftR` 8)
     lo w = fromIntegral (w .&. 0xFF)
 
+readInput :: FilePath -> ExceptT AssembleError IO Text
+readInput f =
+  liftIO (E.try $ readFile f :: IO (Either IOException Text))
+  >>= liftEither . first (FileError . T.show)
+
+writeOutput :: FilePath -> BS.ByteString -> ExceptT AssembleError IO ()
+writeOutput f bs =
+  liftIO (E.try $ BS.writeFile f bs :: IO (Either IOException ()))
+  >>= liftEither . first (FileError . T.show)
+
 main :: IO ()
 main = do
   args <- getArgs
   case args of
     [input, output] -> do
       result <- runExceptT $ do
-        asm              <- readAsm (T.pack input)
+        asm              <- readAsm input
         desugared        <- liftEither $ desugar asm
         (labels, tagged) <- liftEither $ resolveAddresses desugared
         chunks           <- liftEither $ chunkify tagged
-        put              <- liftEither $ emit labels chunks
-        liftIO $ BS.writeFile output . BS.toStrict . runPut $ put
+        bytes            <- liftEither $ BS.toStrict . runPut <$> emit labels chunks
+        writeOutput output bytes
         writeSymbols (output ++ ".sym") labels
+        liftIO $ printf "Assembled %s in %d bytes, %d labels" (BS.length bytes) (Map.size labels)
       case result of
         Left  err -> putStrLn $ "error: " ++ renderError err
         Right ()  -> return ()
