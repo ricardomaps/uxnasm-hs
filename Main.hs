@@ -241,8 +241,11 @@ type Desugar a = StateT DesugarState (Either AssembleError) a
 initialState :: DesugarState
 initialState = DesugarState { scope = "Top", macros = Map.empty, labels = Set.empty, lambdaCount = 0, macroCount = 0, labelCount = 0 }
 
-desugar :: [Span] -> Either AssembleError [Span]
-desugar spans = evalStateT (go spans) initialState
+desugar :: [Span] -> Either AssembleError ([Span], Map Text [Span])
+desugar spans =
+  case runStateT (go spans) initialState of
+    Left e                -> Left e
+    Right (desugared, st) -> Right (desugared, macros st)
   where
     go [] = return []
     
@@ -473,14 +476,16 @@ main = do
   case args of
     [input, output] -> do
       result <- runExceptT $ do
-        asm              <- readAsm input
-        desugared        <- liftEither $ desugar asm
-        (labels, tagged) <- liftEither $ resolveAddresses desugared
-        chunks           <- liftEither $ chunkify tagged
-        bytes            <- liftEither $ BS.toStrict . runPut <$> emit labels chunks
+        asm                 <- readAsm input
+        (desugared, macros) <- liftEither $ desugar asm
+        (labels, tagged)    <- liftEither $ resolveAddresses desugared
+        chunks              <- liftEither $ chunkify tagged
+        bytes               <- liftEither $ BS.toStrict . runPut <$> emit labels chunks
         writeOutput output bytes
         writeSymbols (output ++ ".sym") labels
-        liftIO $ printf "Assembled %s in %d bytes, %d labels" (BS.length bytes) (Map.size labels)
+        liftIO $
+          printf "Assembled %s in %d bytes, %d labels and %d macros"
+            output (BS.length bytes) (Map.size labels) (Map.size macros)
       case result of
         Left  err -> putStrLn $ "error: " ++ renderError err
         Right ()  -> return ()
