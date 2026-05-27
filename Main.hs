@@ -84,6 +84,7 @@ data AssembleError
   | LabelsExceeded SourcePos Text
   | ParserError ParseError
   | FileError Text
+  | InfiniteRecursionIncluding SourcePos Text
   deriving Show
 
 data Chunk = Chunk Int [(Span, Int)]
@@ -102,18 +103,19 @@ maxMacros = 0x100
 
 renderError :: AssembleError -> String
 renderError e = case e of
-  UndefinedLabel p t         -> "undefined label: " ++ T.unpack t ++ " at " ++ show p
-  ForwardPaddingRef p t      -> "forward reference in padding: " ++ T.unpack t ++ " at " ++ show p
-  RelativeJumpOutOfRange p t -> "relative jump out of range to '" ++ T.unpack t ++ " at " ++ show p
-  DuplicateLabel p t         -> "duplicate label: " ++ T.unpack t ++ " at " ++ show p
-  InvalidLabel p t           -> "label " ++ T.unpack t ++ " at " ++ show p ++ " does not fit the format for a label"
-  WritingRewind p o          -> "write rewind to previously written offset " ++ show o ++ " at " ++ show p 
-  ZeroPageWrite p o          -> "write to zero-page at " ++ show p ++ " at offset " ++ show o
-  ParserError e              -> show e
-  FileError e                -> "could not read file: " ++ show e
-  WritingOOM p               -> "writing out of memory limits at: " ++ show p
-  MacrosExceeded p t         -> "macro limit(0x100) exceeded at: " ++ T.unpack t ++ " " ++ show p
-  LabelsExceeded p t         -> "label limit(0x400) exceeded at: " ++ T.unpack t ++ " " ++ show p
+  UndefinedLabel p t             -> "undefined label: " ++ T.unpack t ++ " at " ++ show p
+  ForwardPaddingRef p t          -> "forward reference in padding: " ++ T.unpack t ++ " at " ++ show p
+  RelativeJumpOutOfRange p t     -> "relative jump out of range to '" ++ T.unpack t ++ " at " ++ show p
+  DuplicateLabel p t             -> "duplicate label: " ++ T.unpack t ++ " at " ++ show p
+  InvalidLabel p t               -> "label " ++ T.unpack t ++ " at " ++ show p ++ " does not fit the format for a label"
+  WritingRewind p o              -> "write rewind to previously written offset " ++ show o ++ " at " ++ show p 
+  ZeroPageWrite p o              -> "write to zero-page at " ++ show p ++ " at offset " ++ show o
+  ParserError e                  -> show e
+  FileError e                    -> "could not read file: " ++ show e
+  WritingOOM p                   -> "writing out of memory limits at: " ++ show p
+  MacrosExceeded p t             -> "macro limit(0x100) exceeded at: " ++ T.unpack t ++ " " ++ show p
+  LabelsExceeded p t             -> "label limit(0x400) exceeded at: " ++ T.unpack t ++ " " ++ show p
+  InfiniteRecursionIncluding p t -> "infinite recursion found while including " ++ T.unpack t ++ " at " ++ show p
 
 readHex :: (Read a) => String -> a
 readHex = read . ("0x" ++)
@@ -440,13 +442,16 @@ emit labels chunks = do
       Just target -> Right target
 
 readAsm :: FilePath -> ExceptT AssembleError IO [Span]
-readAsm file = do
-  contents <- readInput file
-  ast      <- liftEither . first ParserError $ parse (asm <* eof) file contents
-  concat <$> mapM include ast
+readAsm = go []
   where
-    include ((_, Include f)) = readAsm (T.unpack f)
-    include x                = return [x]
+    go seen file = do
+      contents <- readInput file
+      ast      <- liftEither . first ParserError $ parse (asm <* eof) file contents
+      concat <$> mapM (include seen) ast
+    include seen (pos, Include f)
+      |  f `elem` seen = throwError (InfiniteRecursionIncluding pos f)
+      | otherwise      = go (f : seen) (T.unpack f) 
+    include _ x = return [x]
 
 writeSymbols :: FilePath -> Map Text Int -> ExceptT AssembleError IO ()
 writeSymbols path labels = do
