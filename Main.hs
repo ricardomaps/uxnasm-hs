@@ -87,6 +87,7 @@ data AssembleError
   | ParserError ParseError
   | FileError Text
   | InfiniteRecursionIncluding SourcePos Text
+  | NestedMacros SourcePos Text
   deriving Show
 
 data Chunk = Chunk Int [(Span, Int)]
@@ -118,6 +119,7 @@ renderError e = case e of
   MacrosExceeded p t             -> "macro limit(0x100) exceeded at: " ++ T.unpack t ++ " " ++ show p
   LabelsExceeded p t             -> "label limit(0x400) exceeded at: " ++ T.unpack t ++ " " ++ show p
   InfiniteRecursionIncluding p t -> "infinite recursion found while including " ++ T.unpack t ++ " at " ++ show p
+  NestedMacros p t               -> "macro " ++ T.unpack t ++ " at " ++ show p ++ " has a disallowed nested macro"
 
 readHex :: (Read a) => String -> a
 readHex = read . ("0x" ++)
@@ -272,26 +274,21 @@ initialState = DesugarState { scope = "Top", macros = Map.empty, labels = Set.em
 expand :: [Span] -> Either AssembleError ([Span], Map Text [Span])
 expand spans =
   case runStateT (go spans) initialState of
-    Left e                -> Left e
-    Right (desugared, st) -> Right (desugared, macros st)
+    Left e                -> throwError e
+    Right (desugared, st) -> return (desugared, macros st)
   where
     go [] = return []
     
     go ((pos, Macro name body) : xs) = do
       st <- get
-      when (invalidName name) $
-        throwError (InvalidLabel pos name)
-      when (isDuplicate name (macros st) (labels st)) $
-        throwError (DuplicateLabel pos name)
+      validateName name pos (macros st) (labels st)
+      validateMacroBody body name pos
       modify $ \s -> s { macros = Map.insert name body (macros s) }
       go xs
       
     go ((pos, Label name) : xs) = do
       st <- get
-      when (invalidName name) $
-        throwError (InvalidLabel pos name)
-      when (isDuplicate name (macros st) (labels st)) $
-        throwError (DuplicateLabel pos name)
+      validateName name pos (macros st) (labels st)
       let (newScope, _) = T.breakOn "/" name
       modify $ \s -> s { scope = newScope, labels = Set.insert name (labels s) }
       (pos, Label name) <:> go xs
@@ -299,10 +296,7 @@ expand spans =
     go ((pos, SubLabel name) : xs) = do
       st <- get
       let labelName = scope st <> "/" <> name
-      when (invalidName name) $
-        throwError (InvalidLabel pos name)
-      when (isDuplicate name (macros st) (labels st)) $
-        throwError (DuplicateLabel pos name)
+      validateName labelName pos (macros st) (labels st)
       modify $ \s -> s { labels = Set.insert labelName (labels s) }
       (pos, Label labelName) <:> go xs
 
@@ -334,10 +328,32 @@ expand spans =
     go (x:xs) = (x :) <$> go xs
 
     (<:>) x xs = fmap (x :) xs
+
+    validateName name pos macros labels = do
+      when (invalidName name) $
+        throwError (InvalidLabel pos name)
+      when (isDuplicate name macros labels) $
+        throwError (DuplicateLabel pos name)
+
+    validateMacroBody body name pos
+      | hasMacro body = throwError (NestedMacros pos name)
+      | otherwise     = return ()
+
+    hasMacro :: [Span] -> Bool
+    hasMacro = any $ \(_, instr) ->
+        case instr of
+          Addr _ _ (Anon body) -> hasMacro body
+          Jump _ (Anon body)   -> hasMacro body
+          x                    -> isMacro x
+      where isMacro (Macro _ _) = True
+            isMacro _           = False
+
     isDuplicate name macros labels = name `Map.member` macros || name `Set.member` labels
+
     addScope scope name
       | "/" `T.isPrefixOf` name || "&" `T.isPrefixOf` name = scope <> "/" <> T.tail name
       | otherwise = name
+
     invalidName name =
       T.null name
       || T.all isHexDigit name
