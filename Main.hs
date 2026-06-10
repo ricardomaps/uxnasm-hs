@@ -19,6 +19,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad
 import Control.Monad.State
+import Control.Monad.Writer
+import Control.Monad.Identity
 import Data.Bits
 import System.Environment
 import System.IO hiding (readFile)
@@ -51,13 +53,13 @@ data Addressing = RelativeAddr | ZeroPageAddr | AbsoluteAddr deriving (Show, Eq)
 
 data AddressingMode = RawAddressing | LiteralAddressing deriving (Show, Eq)
 
-data Ref = Named Text | Anon [Span] deriving Show
+data Ref = Named Text | Anon [Span] | Resolved Word16 deriving Show
 
 data Asm
   = Instr Opcode OpcodeMode
   | Ascii Text
   | Padding PaddingKind PaddingArg
-  | MacroCall Text
+  | MacroCall Text Text
   | RawBinary Binary
   | Jump JumpKind Ref
   | Literal Binary
@@ -229,22 +231,46 @@ asm = optional ignored *> sepEndBy items ignored
       , (RawBinary <$> binary), routine
       ]
 
-data DesugarState = DesugarState
+isPadding :: Asm -> Bool
+isPadding (Padding _ _) = True
+isPadding _             = False
+
+deanonymize :: [Span] -> [Span]
+deanonymize asm = evalState (go asm) 0
+  where
+    go :: [Span] -> State Int [Span]
+    go asm = concat <$> mapM step asm
+
+    step :: Span -> State Int [Span]
+    step (p, Addr a m (Anon body)) = do
+      name  <- fresh
+      body' <- go body
+      return $ (p, Addr a m (Named name)) : body' ++ [(p, Label name)]
+
+    step (p, Jump j (Anon body)) = do
+      name  <- fresh
+      body' <- go body
+      return $ (p, Jump j (Named name)) : body' ++ [(p, Label name)]
+
+    step x = return [x]
+
+    fresh = do
+      c <- get
+      let name = "λ" <> T.show c
+      modify succ
+      return name
+
+data ExpandState = DesugarState
   { scope       :: Text
   , macros      :: Map Text [Span]
   , labels      :: Set Text
-  , lambdaCount :: Int
-  , macroCount  :: Int
-  , labelCount  :: Int
   }
 
-type Desugar a = StateT DesugarState (Either AssembleError) a
+initialState :: ExpandState
+initialState = DesugarState { scope = "Top", macros = Map.empty, labels = Set.empty }
 
-initialState :: DesugarState
-initialState = DesugarState { scope = "Top", macros = Map.empty, labels = Set.empty, lambdaCount = 0, macroCount = 0, labelCount = 0 }
-
-desugar :: [Span] -> Either AssembleError ([Span], Map Text [Span])
-desugar spans =
+expand :: [Span] -> Either AssembleError ([Span], Map Text [Span])
+expand spans =
   case runStateT (go spans) initialState of
     Left e                -> Left e
     Right (desugared, st) -> Right (desugared, macros st)
@@ -253,41 +279,42 @@ desugar spans =
     
     go ((pos, Macro name body) : xs) = do
       st <- get
-      when (invalidName name) $ lift (Left (InvalidLabel pos name))
-      when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
-      when (macroCount st >= maxMacros) $ lift (Left (MacrosExceeded pos name ))
-      modify $ \s -> s { macros = Map.insert name body (macros s), macroCount = macroCount s + 1 }
+      when (invalidName name) $
+        throwError (InvalidLabel pos name)
+      when (isDuplicate name (macros st) (labels st)) $
+        throwError (DuplicateLabel pos name)
+      modify $ \s -> s { macros = Map.insert name body (macros s) }
       go xs
       
     go ((pos, Label name) : xs) = do
       st <- get
-      when (invalidName name) $ lift (Left (InvalidLabel pos name))
-      when (isDuplicate name (macros st) (labels st)) $ lift (Left (DuplicateLabel pos name))
-      when (labelCount st >= maxLabels) $ lift (Left (LabelsExceeded pos name ))
+      when (invalidName name) $
+        throwError (InvalidLabel pos name)
+      when (isDuplicate name (macros st) (labels st)) $
+        throwError (DuplicateLabel pos name)
       let (newScope, _) = T.breakOn "/" name
-      modify $ \s -> s { scope = newScope, labels = Set.insert name (labels s), labelCount = labelCount s + 1 }
+      modify $ \s -> s { scope = newScope, labels = Set.insert name (labels s) }
       (pos, Label name) <:> go xs
 
     go ((pos, SubLabel name) : xs) = do
       st <- get
       let labelName = scope st <> "/" <> name
-      when (invalidName labelName) $ lift (Left (InvalidLabel pos name))
-      when (isDuplicate labelName (macros st) (labels st)) $ lift (Left (DuplicateLabel pos labelName))
-      when (labelCount st >= maxLabels) $ lift (Left (LabelsExceeded pos name ))
-      modify $ \s -> s { labels = Set.insert labelName (labels s), labelCount = labelCount s + 1 }
+      when (invalidName name) $
+        throwError (InvalidLabel pos name)
+      when (isDuplicate name (macros st) (labels st)) $
+        throwError (DuplicateLabel pos name)
+      modify $ \s -> s { labels = Set.insert labelName (labels s) }
       (pos, Label labelName) <:> go xs
 
     go ((pos, Jump j (Anon body)) : xs) = do
-      lambdaName <- freshLambda
-      result <- go body
-      rest   <- go xs
-      return $ (pos, Jump j (Named lambdaName)) : result ++ (pos, Label lambdaName) : rest
+      body' <- go body
+      rest  <- go xs
+      return $ (pos, Jump j (Anon body')) : rest
 
     go ((pos, Addr a m (Anon body)) : xs) = do
-      lambdaName <- freshLambda
-      result <- go body
-      rest   <- go xs
-      return $ (pos, Addr a m (Named lambdaName)) : result ++ (pos, Label lambdaName) : rest
+      body' <- go body
+      rest  <- go xs
+      return $ (pos, Addr a m (Anon body')) : rest
 
     go ((pos, Jump j (Named name)) : xs) = do
       sc <- gets scope
@@ -305,11 +332,6 @@ desugar spans =
         Nothing   -> (pos, Jump JSI (Named nameScoped)) <:> go xs
 
     go (x:xs) = (x :) <$> go xs
-
-    freshLambda = do
-      n <- gets lambdaCount
-      modify $ \s -> s { lambdaCount = n + 1 }
-      return $ "λ" <> T.show n
 
     (<:>) x xs = fmap (x :) xs
     isDuplicate name macros labels = name `Map.member` macros || name `Set.member` labels
@@ -332,114 +354,124 @@ resolveAddresses = go Map.empty initialOffset
       off'            <- advance labels off x
       (labels', rest) <- go labels off' xs
       return (labels', (x, off) : rest)
-
+    
     advance :: Map Text Int -> Int -> Span -> Either AssembleError Int
-    advance _ off (pos, _) | off > 0x9999 = Left (WritingOOM pos)
-    advance _ off (_, RawBinary (Byte _))             = Right $ off + 1
-    advance _ off (_, RawBinary (Short _))            = Right $ off + 2
-    advance _ off (_, Literal (Byte _))               = Right $ off + 2
-    advance _ off (_, Literal (Short _))              = Right $ off + 3
-    advance _ off (_, Ascii text)                     = Right $ off + T.length text
-    advance _ off (_, Instr _ _ )                     = Right $ off + 1
-    advance _ off (_, Jump _ _)                       = Right $ off + 3
-    advance l off (pos, Addr d LiteralAddressing ref) = (1 +) <$> advance l off (pos, Addr d RawAddressing ref)
-    advance _ off (pos, Addr d RawAddressing _)       = Right $ off + if d == AbsoluteAddr then 2 else 1
-    advance _ off (_, Padding t (Hex x))              = Right $
-      case t of
-        RelativePadding -> off + fromIntegral x
-        AbsolutePadding -> fromIntegral x
-    advance l off (pos, Padding t (Ident i)) =
-      case Map.lookup i l of
-        Nothing -> Left (ForwardPaddingRef pos i)
-        Just x  -> Right $ case t of
-          RelativePadding -> off + fromIntegral x
-          AbsolutePadding -> fromIntegral x
-    advance _ off _ = Right off
+    advance lbls off (pos, instr)
+      | off > 0x9999 && not (isPadding instr) = throwError (WritingOOM pos)
+      | otherwise = 
+        case instr of
+          RawBinary (Byte _)           -> return $ off + 1
+          RawBinary (Short _)          -> return $ off + 2
+          Literal (Byte _)             -> return $ off + 2
+          Literal (Short _)            -> return $ off + 3
+          Ascii text                   -> return $ off + T.length text
+          Instr _ _                    -> return $ off + 1
+          Jump _ _                     -> return $ off + 3
+          Addr d LiteralAddressing ref -> (1 +) <$> advance lbls off (pos, Addr d RawAddressing ref)
+          Addr d RawAddressing _       -> return $ off + if d == AbsoluteAddr then 2 else 1
+          Padding t (Hex x)            ->
+            case t of
+              RelativePadding -> return $ off + fromIntegral x
+              AbsolutePadding -> return $ fromIntegral x
+          Padding t (Ident i)          ->
+            case Map.lookup i lbls of
+              Nothing -> throwError (ForwardPaddingRef pos i)
+              Just x  -> case t of
+                RelativePadding -> return $ off + fromIntegral x
+                AbsolutePadding -> return $ fromIntegral x
+          _ -> return off
+
 
 chunkify :: [(Span, Int)] -> Either AssembleError [Chunk]
 chunkify [] = Right []
 chunkify xs =
-  let (pads, rest)    = span (isPadding . fst) xs
-      (instrs, rest') = break (isPadding . fst) rest
+  let (pads, rest)    = span (isPadding . snd . fst) xs
+      (instrs, rest') = break (isPadding . snd . fst) rest
   in case (pads, rest) of
        ([], _) -> do
          chunks <- chunkify rest'
          return $ Chunk 0 instrs : chunks
-       (_, []) -> Right []
+       (_, []) -> return []
        ((_, start):_, ((pos, _), end):_) ->
          if end < start
-           then Left (WritingRewind pos end)
+           then throwError (WritingRewind pos end)
         else if end < initialOffset
-          then Left (ZeroPageWrite pos end)
+          then throwError (ZeroPageWrite pos end)
         else do
           chunks <- chunkify rest'
           return $ Chunk (end - start) instrs : chunks
   where
-    isPadding ((_, Padding _ _)) = True
-    isPadding _             = False
 
-emit :: Map Text Int -> [Chunk] -> Either AssembleError Put
-emit labels chunks = do
-  puts <- mapM emitChunk chunks
-  return $ sequence_ puts
+emit :: Map Text Int -> [Chunk] -> Put
+emit labels = mapM_ emitChunk 
   where
-    emitChunk (Chunk n asm) = do
-          steps <- mapM step asm
-          return $ putByteString (BS.replicate (fromIntegral n) 0x00) >> sequence_ steps
+    emitChunk (Chunk n asm) = putByteString (BS.replicate (fromIntegral n) 0x00) >> mapM_ step asm
 
-    step :: (Span, Int) -> Either AssembleError Put
-    step ((pos, _), off) | off < initialOffset    = Left (ZeroPageWrite pos off)
-    step ((pos, _), off) | off > maxOffset = Left (WritingOOM pos)
+    step ((_, instr), _) = 
+      case instr of
+        RawBinary (Byte b)         -> putWord8 b
+        RawBinary (Short s)        -> putWord16be s
+        Literal (Byte b)           -> putWord8 0x80 >> putWord8 b
+        Literal (Short s)          -> putWord8 0xa0 >> putWord16be s
+        Ascii text                 -> putByteString (encodeUtf8 text)
+        Instr opcode mode          ->
+          let 
+            byte  = if opcode == LIT then 0x80 else fromIntegral (fromEnum opcode)
+            flags = foldr (.|.) 0x00
+              [ if shortMode  mode then 0x20 else 0x00
+              , if returnMode mode then 0x40 else 0x00
+              , if keepMode   mode then 0x80 else 0x00
+              ]
+          in putWord8 (byte .|. flags)
 
-    step ((_, RawBinary (Byte b)),  _) = return $ putWord8 b
+        Jump j (Resolved target)   ->
+          let op  = case j of JSI -> 0x60; JMI -> 0x40; JCI -> 0x20
+          in putWord8 op >> putWord16be target
 
-    step ((_, RawBinary (Short s)), _) = return $ putWord16be s
+        Addr a m (Resolved target) ->
+          let 
+            lit =
+              case (m, a) of
+                (LiteralAddressing, AbsoluteAddr) -> putWord8 0xa0
+                (LiteralAddressing, _)            -> putWord8 0x80
+                _                                 -> pure ()
+            ref =
+              case a of
+                AbsoluteAddr -> putWord16be (fromIntegral target)
+                ZeroPageAddr -> putWord8 (fromIntegral target)
+                RelativeAddr -> putWord8 (fromIntegral target)
+          in lit >> ref
+        _                          -> pure ()
 
-    step ((_, Literal (Byte b)),    _) = return $ putWord8 0x80 >> putWord8 b
 
-    step ((_, Literal (Short s)),   _) = return $ putWord8 0xa0 >> putWord16be s
-
-    step ((_, Ascii text),          _) = return $ putByteString (encodeUtf8 text)
-
-    step ((_, Instr opcode mode),   _) = return $ putWord8 (byte .|. flags)
-      where
-        byte  = if opcode == LIT then 0x80 else fromIntegral (fromEnum opcode)
-        flags = foldr (.|.) 0x00
-          [ if shortMode  mode then 0x20 else 0x00
-          , if returnMode mode then 0x40 else 0x00
-          , if keepMode   mode then 0x80 else 0x00
-          ]
-
-    step ((pos, Jump j (Named n)), off) = do
-      target <- lookupLabel pos n
-      let op  = case j of JSI -> 0x60; JMI -> 0x40; JCI -> 0x20
-      return $ putWord8 op >> putWord16be (fromIntegral $ target - (off + 1) - 2)
-
-    step ((pos, Addr a m (Named n)), off) = do
-      target <- lookupLabel pos n
+resolveReferences :: Map Text Int -> [(Span, Int)] -> Either AssembleError ([(Span, Int)], Set Text)
+resolveReferences labels asm = runWriterT (mapM go asm)
+  where
+    go ((pos, Addr a m (Named name)), off) = do
+      target <- lookupTarget pos name
       let
         litSize = if m == LiteralAddressing then 1 else 0
-        lit =
-          case (m, a) of
-            (LiteralAddressing, AbsoluteAddr) -> putWord8 0xa0
-            (LiteralAddressing, _)            -> putWord8 0x80
-            _                                 -> return ()
-      ref <-
+      res <-
         case a of
-          AbsoluteAddr -> return $ putWord16be (fromIntegral target)
-          ZeroPageAddr -> return $ putWord8 (fromIntegral target)
+          AbsoluteAddr -> return (Resolved $ fromIntegral target)
+          ZeroPageAddr -> return (Resolved $ fromIntegral target)
           RelativeAddr ->
             let delta = target - (fromIntegral off + litSize) - 2
             in if delta < -128 || delta > 127
-                 then Left (RelativeJumpOutOfRange pos n)
-                 else return $ putWord8 (fromIntegral delta)
-      return $ lit >> ref
+                 then throwError (RelativeJumpOutOfRange pos name)
+                 else return (Resolved $ fromIntegral delta)
+      return ((pos, Addr a m res), off)
 
-    step x = return (pure ())
+    go ((pos, Jump j (Named name)), off) = do
+      target <- lookupTarget pos name
+      let res = fromIntegral $ target - (off + 1) - 2
+      return ((pos, Jump j (Resolved res)), off)
 
-    lookupLabel pos n = case Map.lookup n labels of
-      Nothing     -> Left (UndefinedLabel pos n)
-      Just target -> Right target
+    go x = return x
+
+    lookupTarget pos name = case Map.lookup name labels of
+      Nothing     -> throwError (UndefinedLabel pos name) 
+      Just target -> tell (Set.singleton name) >> return target
 
 readAsm :: FilePath -> ExceptT AssembleError IO [Span]
 readAsm = go []
@@ -457,13 +489,14 @@ writeSymbols :: FilePath -> Map Text Int -> ExceptT AssembleError IO ()
 writeSymbols path labels = do
   h <- liftIO (openBinaryFile path WriteMode) `catchError` \_ -> throwError (FileError (T.pack path))
   liftIO $ forM_ (Map.assocs labels) $ \(name, addr) -> do
-    BS.hPut h $ BS.pack [hi addr, lo addr]
+    BS.hPut h $ BS.pack [fromIntegral (addr `shiftR` 8), fromIntegral (addr .&. 0xFF)]
     BS.hPut h $ encodeUtf8 name
     BS.hPut h $ BS.singleton 0
   liftIO $ hClose h
-  where
-    hi w = fromIntegral (w `shiftR` 8)
-    lo w = fromIntegral (w .&. 0xFF)
+
+printUnused :: Set Text -> Set Text -> IO ()
+printUnused labels references = forM_ unused (\l -> putStrLn $ "Unused label: " ++ T.unpack l)
+  where unused = Set.toList $ Set.difference labels references
 
 readInput :: FilePath -> ExceptT AssembleError IO Text
 readInput f =
@@ -482,14 +515,18 @@ main = do
     [input, output] -> do
       result <- runExceptT $ do
         asm                 <- readAsm input
-        (desugared, macros) <- liftEither $ desugar asm
-        (labels, tagged)    <- liftEither $ resolveAddresses desugared
-        chunks              <- liftEither $ chunkify tagged
-        bytes               <- liftEither $ BS.toStrict . runPut <$> emit labels chunks
+        (expanded, macros)  <- liftEither $ expand asm
+        (labels, tagged)    <- liftEither $ resolveAddresses (deanonymize expanded)
+        (resolved, refs)    <- liftEither $ resolveReferences labels tagged
+        chunks              <- liftEither $ chunkify resolved
+        bytes               <- return . BS.toStrict . runPut $ emit labels chunks
         writeOutput output bytes
         writeSymbols (output ++ ".sym") labels
-        liftIO $
-          printf "Assembled %s in %d bytes, %d labels and %d macros"
+        liftIO $ do
+          let lbls = Set.fromList $ Map.keys labels 
+          printUnused lbls refs
+          printf
+            "Assembled %s in %d bytes, %d labels and %d macros"
             output (BS.length bytes) (Map.size labels) (Map.size macros)
       case result of
         Left  err -> putStrLn $ "error: " ++ renderError err
