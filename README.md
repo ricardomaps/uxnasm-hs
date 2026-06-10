@@ -6,7 +6,7 @@ An assembler written in Haskell for [Uxntal](https://wiki.xxiivv.com/site/uxntal
 This assembler does not output the symbols in the symbol file in the same order as drifblim. It's also not as strict with comments and whitespace.
 
 ## Building
-With a recent enough version of ghc, just `ghc Main.hs`
+With a recent enough version of ghc, just `ghc Main.hs -o uxnasm-hs`
 
 ## Usage
 Just like uxnasm or drifblim, "uxnasm-hs [-v] input.tal output.rom"
